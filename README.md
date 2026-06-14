@@ -120,8 +120,7 @@ functions) · vanilla JavaScript/HTML · static hosting · n8n · Python (data i
 
 ## About
 
-Built solo by the academy's owner-operator, alongside an M.S. in Artificial
-Intelligence in Business. <!-- Edit this line / add contact + portfolio links. -->
+Built solo by **William Sandoval** — M.S. in Artificial Intelligence in Business, Arizona State University (W. P. Carey). [LinkedIn](https://www.linkedin.com/in/william-sandoval-ms-654a75162)
 
 > Screenshots in this repo use anonymized sample data. The production system is
 > access-controlled and is not publicly demoable, by design.
