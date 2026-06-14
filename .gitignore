@@ -1,0 +1,17 @@
+# Never commit secrets or local junk
+.env
+.env.*
+*.key
+*.pem
+secrets*
+config.local.*
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+
+# Never commit real client/roster data
+*.xlsx
+*.xls
+*.csv
+roster*
