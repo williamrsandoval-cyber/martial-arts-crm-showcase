@@ -67,9 +67,9 @@ A focused CRM the front desk and coaches actually use:
   their job needs, including a privacy-safe student card that shows rank and time
   in belt with no contact details.
 
-<!-- Screenshot suggestions (add to docs/screenshots/ and the images render):
-![Promotion board](docs/screenshots/owner-dashboard.png)
--->
+**Screens** — all student and staff names and contact details are redacted:
+
+![Promotion board: every active student scored Eligible / Approaching / Building against their belt's real thresholds, with the owner approval gate](promotion-board.png)
 
 ## Architecture
 
@@ -108,6 +108,10 @@ center, not an afterthought:
 - **Tenant isolation by design.** In the multi-tenant kit, every client academy
   gets its *own* database. No two businesses ever share storage, so there is no
   cross-tenant query path to get wrong.
+
+![Append-only activity log: every change records when, who, and what — names and details redacted here](activity-log.png)
+
+![Staff and roles: owner assigns instructor / front-desk access; these roles cannot see contact info or edit ranks](staff-roles.png)
 
 ## From internal tool to product
 

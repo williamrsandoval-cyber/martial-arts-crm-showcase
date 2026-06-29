@@ -1,9 +1,21 @@
 -- ============================================================
+-- MARTIAL ARTS CRM — SCHEMA + SECURITY (data-free, current)
+-- Full structure of the production database: tables, RLS policies,
+-- SECURITY DEFINER functions, reporting views, the audit log, the
+-- promotion-approval workflow, and attendance-integrity rules.
+-- NO client data, NO belt seed, NO credentials. Structure only.
+--
+-- Objects: 17 tables, 4 reporting views, 8 functions, 40 RLS policies.
+-- ============================================================
+
+
+-- ===================== CORE: tables, RLS, base functions, reporting views =====================
+-- ============================================================
 -- MARTIAL ARTS CRM — FRESH INSTALL: SCHEMA + SECURITY
 -- Builds an EMPTY, fully-secured CRM (tables, RLS, views,
 -- promote/coach-note functions). NO client data.
 -- Run 1st. Then 02_starter_belts.sql. Then seed owner + import.
--- Full schema with no client data. Structure only.
+-- Generated from the validated Patriot chain (data excluded) 2026-06-13.
 -- ============================================================
 
 --
@@ -437,7 +449,7 @@ CREATE VIEW public.v_checkin_roster WITH (security_invoker='false') AS
     e.stripes
    FROM (public.enrollments e
      JOIN public.students s ON ((s.id = e.student_id)))
-  WHERE (e.status = 'active'::text);
+  WHERE ((e.status = 'active'::text) AND public.is_staff());
 
 
 --
@@ -1231,7 +1243,7 @@ CREATE POLICY lesson_tracks_write ON public.lesson_tracks USING (public.is_owner
 -- Name: attendance owner delete; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY "owner delete" ON public.attendance FOR DELETE TO authenticated USING (public.is_owner());
+CREATE POLICY "staff delete" ON public.attendance FOR DELETE TO authenticated USING (public.is_staff());
 
 
 --
@@ -1482,3 +1494,346 @@ ALTER TABLE public.students ENABLE ROW LEVEL SECURITY;
 
 --
 --
+
+CREATE INDEX IF NOT EXISTS idx_attendance_class_date ON public.attendance USING btree (class_date);
+
+
+-- ===================== AUDIT LOG: audit_log table + fn_audit trigger (who changed what) =====================
+-- 032_audit_log.sql
+-- Activity log for the owner: every insert/update/delete on the key tables is
+-- recorded with who did it, what, and when. Triggers catch changes no matter
+-- where they come from (the app, the SQL editor, anything).
+--
+-- Read access: owner only. Writes happen only through the SECURITY DEFINER
+-- trigger function, so staff never touch the table directly.
+
+create table if not exists audit_log (
+  id         bigint generated always as identity primary key,
+  at         timestamptz not null default now(),
+  actor_uid  uuid,
+  actor      text,
+  action     text not null,   -- INSERT | UPDATE | DELETE
+  entity     text not null,   -- table name
+  entity_id  text,
+  summary    text,
+  subject_student_id uuid
+);
+create index if not exists idx_audit_at on audit_log (at desc);
+
+alter table audit_log enable row level security;
+drop policy if exists "owner read audit" on audit_log;
+create policy "owner read audit" on audit_log
+  for select to authenticated using (public.is_owner());
+grant select on audit_log to authenticated;
+
+create or replace function public.fn_audit() returns trigger
+language plpgsql security definer set search_path = public, pg_temp
+as $$
+declare j jsonb; v_actor text; v_id text; v_sum text;
+begin
+  if TG_OP = 'DELETE' then j := to_jsonb(OLD); else j := to_jsonb(NEW); end if;
+
+  v_actor := coalesce(
+    (select full_name from staff where id = auth.uid()),
+    (select full_name from staff_invites where lower(email) = lower(auth.jwt() ->> 'email')),
+    nullif(auth.jwt() ->> 'email',''),
+    'system');
+
+  v_id := coalesce(j ->> 'id', '');
+
+  v_sum := case TG_TABLE_NAME
+    when 'students'         then trim(coalesce(j->>'first_name','')||' '||coalesce(j->>'last_name',''))
+    when 'enrollments'      then trim(coalesce(j->>'program','')||' '||coalesce(j->>'belt',''))
+    when 'promotions'       then 'to '||coalesce(j->>'to_belt','')
+    when 'student_notes'    then 'coach note'
+    when 'trials'           then trim(coalesce(j->>'first_name','')||' '||coalesce(j->>'last_name',''))||' ('||coalesce(j->>'status','')||')'
+    when 'enrollment_pauses' then 'hold'
+    when 'staff_invites'    then trim(coalesce(j->>'email','')||' '||coalesce(j->>'role',''))
+    else '' end;
+
+  insert into audit_log(actor_uid, actor, action, entity, entity_id, summary)
+  values (auth.uid(), v_actor, TG_OP, TG_TABLE_NAME, v_id, v_sum);
+  return null;  -- AFTER trigger; return value ignored
+end;
+$$;
+
+do $$
+declare t text;
+begin
+  foreach t in array array['students','enrollments','promotions','student_notes',
+                           'trials','enrollment_pauses','staff_invites'] loop
+    execute format('drop trigger if exists trg_audit on public.%I', t);
+    execute format('create trigger trg_audit after insert or update or delete on public.%I '
+                   'for each row execute function public.fn_audit()', t);
+  end loop;
+end $$;
+
+-- enhanced summary (resolves student name + subject id)
+create or replace function public.fn_audit() returns trigger
+language plpgsql security definer set search_path = public, pg_temp
+as $$
+declare j jsonb; v_actor text; v_id text; v_sum text; v_name text; v_sid uuid; v_enr uuid;
+begin
+  if TG_OP = 'DELETE' then j := to_jsonb(OLD); else j := to_jsonb(NEW); end if;
+
+  v_actor := coalesce(
+    (select full_name from staff where id = auth.uid()),
+    (select full_name from staff_invites where lower(email) = lower(auth.jwt() ->> 'email')),
+    nullif(auth.jwt() ->> 'email',''),
+    'system');
+
+  v_id := coalesce(j ->> 'id', '');
+
+  -- Resolve the student this row concerns (directly, or via its enrollment).
+  v_sid := nullif(j ->> 'student_id','')::uuid;
+  v_enr := nullif(j ->> 'enrollment_id','')::uuid;
+  if v_sid is null and v_enr is not null then
+    select student_id into v_sid from enrollments where id = v_enr;
+  end if;
+  if v_sid is null and TG_TABLE_NAME = 'students' then
+    v_sid := nullif(j ->> 'id','')::uuid;
+  end if;
+  if v_sid is not null then
+    select nullif(trim(coalesce(first_name,'')||' '||coalesce(last_name,'')),'')
+      into v_name from students where id = v_sid;
+  end if;
+
+  v_sum := case TG_TABLE_NAME
+    when 'students'          then trim(coalesce(j->>'first_name','')||' '||coalesce(j->>'last_name',''))
+    when 'enrollments'       then coalesce(v_name,'student '||left(coalesce(j->>'student_id','?'),8))||' — '||trim(coalesce(j->>'program','')||' '||coalesce(j->>'belt',''))
+    when 'promotions'        then coalesce(v_name,'?')||' — to '||coalesce(j->>'to_belt','')||case when coalesce(j->>'to_stripes','0')<>'0' then ' · '||(j->>'to_stripes')||' stripe(s)' else '' end
+    when 'student_notes'     then coalesce(v_name,'?')||' — coach note'
+    when 'trials'            then trim(coalesce(j->>'first_name','')||' '||coalesce(j->>'last_name',''))||' ('||coalesce(j->>'status','')||')'
+    when 'enrollment_pauses' then coalesce(v_name,'?')||' — hold'
+    when 'staff_invites'     then trim(coalesce(j->>'email','')||' '||coalesce(j->>'role',''))
+    else '' end;
+
+  insert into audit_log(actor_uid, actor, action, entity, entity_id, summary, subject_student_id)
+  values (auth.uid(), v_actor, TG_OP, TG_TABLE_NAME, v_id, v_sum, v_sid);
+  return null;
+end;
+$$;
+
+-- ===== single-entry promotions + skip flag (from 034) =====
+-- 1) Audit trigger honors a skip flag.
+create or replace function public.fn_audit() returns trigger
+language plpgsql security definer set search_path = public, pg_temp
+as $$
+declare j jsonb; v_actor text; v_id text; v_sum text; v_name text; v_sid uuid; v_enr uuid;
+begin
+  if coalesce(current_setting('app.skip_audit', true),'') = 'on' then
+    return null;  -- this change is captured by a higher-level action
+  end if;
+
+  if TG_OP = 'DELETE' then j := to_jsonb(OLD); else j := to_jsonb(NEW); end if;
+
+  v_actor := coalesce(
+    (select full_name from staff where id = auth.uid()),
+    (select full_name from staff_invites where lower(email) = lower(auth.jwt() ->> 'email')),
+    nullif(auth.jwt() ->> 'email',''),
+    'system');
+
+  v_id := coalesce(j ->> 'id', '');
+
+  v_sid := nullif(j ->> 'student_id','')::uuid;
+  v_enr := nullif(j ->> 'enrollment_id','')::uuid;
+  if v_sid is null and v_enr is not null then
+    select student_id into v_sid from enrollments where id = v_enr;
+  end if;
+  if v_sid is null and TG_TABLE_NAME = 'students' then
+    v_sid := nullif(j ->> 'id','')::uuid;
+  end if;
+  if v_sid is not null then
+    select nullif(trim(coalesce(first_name,'')||' '||coalesce(last_name,'')),'')
+      into v_name from students where id = v_sid;
+  end if;
+
+  v_sum := case TG_TABLE_NAME
+    when 'students'          then trim(coalesce(j->>'first_name','')||' '||coalesce(j->>'last_name',''))
+    when 'enrollments'       then coalesce(v_name,'student '||left(coalesce(j->>'student_id','?'),8))||' — '||trim(coalesce(j->>'program','')||' '||coalesce(j->>'belt',''))
+    when 'promotions'        then coalesce(v_name,'?')||' — to '||coalesce(j->>'to_belt','')||case when coalesce(j->>'to_stripes','0')<>'0' then ' · '||(j->>'to_stripes')||' stripe(s)' else '' end
+    when 'student_notes'     then coalesce(v_name,'?')||' — coach note'
+    when 'trials'            then trim(coalesce(j->>'first_name','')||' '||coalesce(j->>'last_name',''))||' ('||coalesce(j->>'status','')||')'
+    when 'enrollment_pauses' then coalesce(v_name,'?')||' — hold'
+    when 'staff_invites'     then trim(coalesce(j->>'email','')||' '||coalesce(j->>'role',''))
+    else '' end;
+
+  insert into audit_log(actor_uid, actor, action, entity, entity_id, summary, subject_student_id)
+  values (auth.uid(), v_actor, TG_OP, TG_TABLE_NAME, v_id, v_sum, v_sid);
+  return null;
+end;
+$$;
+
+-- 2) promote_enrollment silences the audit on its enrollment update, so the only
+--    log entry is the promotion itself.
+create or replace function public.promote_enrollment(
+  p_enrollment uuid,
+  p_to_belt    text,
+  p_to_stripes int  default 0,
+  p_date       date default current_date,
+  p_notes      text default null
+) returns void
+language plpgsql security definer set search_path = public, pg_temp
+as $$
+declare v_from_belt text; v_from_stripes int; v_who text;
+begin
+  if not public.can_promote() then
+    raise exception 'Not authorized to promote';
+  end if;
+  select belt, stripes into v_from_belt, v_from_stripes from enrollments where id = p_enrollment;
+  if not found then raise exception 'Enrollment % not found', p_enrollment; end if;
+
+  select coalesce(s.full_name, inv.full_name, auth.jwt() ->> 'email', 'staff')
+    into v_who
+    from (select 1) z
+    left join staff         s   on s.id = auth.uid()
+    left join staff_invites inv on lower(inv.email) = lower(auth.jwt() ->> 'email');
+
+  perform set_config('app.skip_audit', 'on', true);   -- don't log the raw enrollment update
+  update enrollments
+     set belt = p_to_belt,
+         stripes = coalesce(p_to_stripes, 0),
+         last_promotion_date = coalesce(p_date, current_date),
+         classes_baseline = 0,
+         baseline_date = coalesce(p_date, current_date)
+   where id = p_enrollment;
+  perform set_config('app.skip_audit', 'off', true);  -- log the promotion below
+
+  insert into promotions
+    (enrollment_id, from_belt, from_stripes, to_belt, to_stripes, promotion_date, approved_by, notes)
+  values
+    (p_enrollment, v_from_belt, v_from_stripes, p_to_belt, coalesce(p_to_stripes,0),
+     coalesce(p_date, current_date), coalesce(v_who,'staff'), p_notes);
+end;
+$$;
+
+
+-- ===================== PROMOTION APPROVAL: owner clear-to-promote flag + setter + roster =====================
+-- 037_promotion_approval.sql
+-- Owner can flag an enrollment as "cleared to promote". Instructors see the flag
+-- on the check-in roster. The flag is consumed (cleared) when the student is
+-- actually promoted.
+
+alter table enrollments add column if not exists promo_approved    boolean not null default false;
+alter table enrollments add column if not exists promo_approved_at  date;
+
+-- Surface the flag to instructors via the check-in roster (keep the is_staff guard from 036).
+drop view if exists public.v_checkin_roster;
+create view public.v_checkin_roster with (security_invoker = false) as
+  select e.id as enrollment_id, e.student_id, s.first_name, s.last_name,
+         e.program, e.class_group, e.belt, e.stripes, e.promo_approved
+  from enrollments e
+  join students s on s.id = e.student_id
+  where e.status = 'active' and public.is_staff();
+grant select on v_checkin_roster to authenticated;
+
+-- Owner-only setter. No audit entry (it's a transient workflow flag; the actual
+-- promotion is what gets logged).
+create or replace function public.set_promo_approval(p_enrollment uuid, p_approved boolean)
+returns void language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not public.is_owner() then
+    raise exception 'Only the owner can approve promotions';
+  end if;
+  perform set_config('app.skip_audit', 'on', true);
+  update enrollments
+     set promo_approved    = coalesce(p_approved, false),
+         promo_approved_at = case when coalesce(p_approved, false) then current_date else null end
+   where id = p_enrollment;
+  perform set_config('app.skip_audit', 'off', true);
+end $$;
+grant execute on function public.set_promo_approval(uuid, boolean) to authenticated;
+
+-- Promotions consume the approval: clear the flag as part of the promotion.
+create or replace function public.promote_enrollment(
+  p_enrollment uuid,
+  p_to_belt    text,
+  p_to_stripes int  default 0,
+  p_date       date default current_date,
+  p_notes      text default null
+) returns void
+language plpgsql security definer set search_path = public, pg_temp
+as $$
+declare v_from_belt text; v_from_stripes int; v_who text;
+begin
+  if not public.can_promote() then
+    raise exception 'Not authorized to promote';
+  end if;
+  select belt, stripes into v_from_belt, v_from_stripes from enrollments where id = p_enrollment;
+  if not found then raise exception 'Enrollment % not found', p_enrollment; end if;
+
+  select coalesce(s.full_name, inv.full_name, auth.jwt() ->> 'email', 'staff')
+    into v_who
+    from (select 1) z
+    left join staff         s   on s.id = auth.uid()
+    left join staff_invites inv on lower(inv.email) = lower(auth.jwt() ->> 'email');
+
+  perform set_config('app.skip_audit', 'on', true);
+  update enrollments
+     set belt = p_to_belt,
+         stripes = coalesce(p_to_stripes, 0),
+         last_promotion_date = coalesce(p_date, current_date),
+         classes_baseline = 0,
+         baseline_date = coalesce(p_date, current_date),
+         promo_approved = false,
+         promo_approved_at = null
+   where id = p_enrollment;
+  perform set_config('app.skip_audit', 'off', true);
+
+  insert into promotions
+    (enrollment_id, from_belt, from_stripes, to_belt, to_stripes, promotion_date, approved_by, notes)
+  values
+    (p_enrollment, v_from_belt, v_from_stripes, p_to_belt, coalesce(p_to_stripes,0),
+     coalesce(p_date, current_date), coalesce(v_who,'staff'), p_notes);
+end;
+$$;
+
+
+-- ===================== ATTENDANCE INTEGRITY: one check-in per enrollment per day =====================
+-- 038_attendance_unique.sql
+-- Attendance had no uniqueness rule, so a student could be recorded twice for the
+-- same day (two devices, a re-check after a failed load, a back-dated log of a day
+-- already recorded). Duplicates inflate classes_since_promo — the number that drives
+-- promotion eligibility. De-dupe existing rows (keep the earliest per student+date),
+-- then enforce one attendance row per enrollment per day. (attendance has no audit
+-- trigger, so no skip needed.)
+
+delete from attendance a
+using attendance b
+where a.enrollment_id = b.enrollment_id
+  and a.class_date    = b.class_date
+  and a.id > b.id;
+
+create unique index if not exists uq_attendance_enrollment_date
+  on attendance (enrollment_id, class_date);
+
+-- The old non-unique index on the same columns is now redundant.
+drop index if exists idx_attendance_enrollment_date;
+
+
+-- ===================== ATTENDANCE: staff may remove a mistaken check-in =====================
+-- 039_attendance_staff_delete.sql
+-- Allow instructors / front-desk (any staff) to remove an attendance entry — e.g.
+-- when a check-in was recorded under the wrong date — not just the owner.
+-- Recording attendance was already staff-level; removing a mistake should be too.
+
+drop policy if exists "owner delete" on public.attendance;
+create policy "staff delete" on public.attendance
+  for delete to authenticated using (public.is_staff());
+
+
+-- ===================== STAFF CARD: last-promotion on the privacy-safe roster view =====================
+-- 040_checkin_roster_lastpromo.sql
+-- Add last_promotion_date to the staff-facing roster view so staff can see a
+-- student's rank history (last promotion + time in belt) without access to the
+-- owner-only students table or contact PII. Keeps the is_staff() guard.
+
+drop view if exists public.v_checkin_roster;
+create view public.v_checkin_roster with (security_invoker = false) as
+  select e.id as enrollment_id, e.student_id, s.first_name, s.last_name,
+         e.program, e.class_group, e.belt, e.stripes, e.promo_approved,
+         e.last_promotion_date
+  from enrollments e
+  join students s on s.id = e.student_id
+  where e.status = 'active' and public.is_staff();
+grant select on v_checkin_roster to authenticated;
