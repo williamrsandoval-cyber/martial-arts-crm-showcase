@@ -47,16 +47,25 @@ A focused CRM the front desk and coaches actually use:
 
 - **Promotion board** — every active student scored against their belt's real
   thresholds: *Eligible / Approaching / Building*, with the specific next step.
-- **Attendance by class** — one-tap check-in from a phone or tablet at the desk.
+- **Owner-approved promotions** — a deliberate human-in-the-loop gate: the owner
+  clears a student for promotion, and only then can an instructor apply the rank
+  change. Accidental or unilateral promotions are designed out.
+- **Attendance by class** — one-tap check-in from a phone or tablet at the desk,
+  with a database rule that prevents the same student being checked in twice for
+  one class so promotion eligibility can't be silently corrupted.
 - **Audit-logged promotions** — promoting a student records the rank change *and*
   who signed off and when. The database makes the approver a required field, so
   no promotion can exist without accountability.
+- **Activity log** — an append-only record of changes (promotions, edits, notes)
+  that resolves the acting user and the affected student into each entry, so
+  there is a readable history of who did what.
 - **Coach notes** — a running, attributed log per student, separate from the
   owner's private notes.
 - **Retention flags** — active students surfaced by time since last class, mapped
   to an outreach stage.
 - **Role-based views** — owner, instructor, and front desk each see only what
-  their job needs.
+  their job needs, including a privacy-safe student card that shows rank and time
+  in belt with no contact details.
 
 <!-- Screenshot suggestions (add to docs/screenshots/ and the images render):
 ![Promotion board](docs/screenshots/owner-dashboard.png)
@@ -68,8 +77,8 @@ A deliberately lightweight stack — no framework, no build step, one HTML file
 talking to a managed Postgres. Full detail in [ARCHITECTURE.md](ARCHITECTURE.md)
 and the data-free [schema.sql](schema.sql).
 
-- **Database:** PostgreSQL (Supabase), 16 tables, 4 reporting views, and SQL
-  functions for the privileged actions.
+- **Database:** PostgreSQL (Supabase), 17 tables, 4 reporting views, an
+  append-only audit log, and SQL functions for the privileged actions.
 - **Security:** PostgreSQL Row-Level Security on every table, driven by a `staff`
   role table and `SECURITY DEFINER` helper functions.
 - **App:** a single self-contained HTML/JS file (no framework), deployed as a
@@ -91,6 +100,11 @@ center, not an afterthought:
 - **Privileged actions go through audited functions.** Promotions and notes are
   written by `SECURITY DEFINER` functions that verify the caller's role and stamp
   their identity from the login — the approver can't be forged or left blank.
+- **Human-in-the-loop on rank changes.** Promotions pass through an explicit owner
+  approval step before an instructor can apply them, so authority over rank is
+  separated from the act of recording it.
+- **An accountable trail.** An append-only audit log records who changed what and
+  which student it affected, so the history is reviewable rather than implicit.
 - **Tenant isolation by design.** In the multi-tenant kit, every client academy
   gets its *own* database. No two businesses ever share storage, so there is no
   cross-tenant query path to get wrong.
